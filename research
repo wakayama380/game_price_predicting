@@ -1,0 +1,561 @@
+#MelSpectrogramです
+import argparse
+import sys
+import joblib
+from pathlib import Path
+from multiprocessing import Pool
+import os
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.mixture import GaussianMixture
+from scipy.io import loadmat
+from tqdm import tqdm
+import traceback
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import math
+
+sys.path.append('.')
+from modeling.pytorch.deep_autoencoder import DAEwoBatchNorm
+from feature_extraction.calc_feature import CalcFeature
+from loading.feature import GetBinaryFeature
+from util.tools import pathlib_mkdir
+from util.tools import load_list_file
+from util.tools import read_length_shift
+from util.tools import dc_offset
+from util.tools import dropna_from_list
+from util.tools import split_rotation
+from util.ntncms import read_bin
+from util.manage_list import unroll
+from scoring.score import ScoreSave
+from scoring.f_value import f_value
+from scoring.overdetection_accuracy import calc_healthy_sample_accuracy
+from scoring.overdetection_accuracy import calc_anomaly_sample_accuracy
+
+from pandas.plotting import register_matplotlib_converters
+register_matplotlib_converters()
+
+###################
+# argparse
+###################
+parser = argparse.ArgumentParser()
+#修正
+parser.add_argument('gmm', type=str)
+#修正
+parser.add_argument('--files', type=int, default=100)
+parser.add_argument('-b', '--bottleneck', type=int, default=16)
+parser.add_argument('--component',  default=8, type=int)
+parser.add_argument('--covar', default='full', type=str)
+parser.add_argument('--window-shift', dest='w_and_s', default='w5.12_s0.1')
+parser.add_argument('--percentile', type=int, dest='designed_percentile', default=99)
+parser.add_argument('--nf', '--force-nn-training', dest='network', action='store_true')
+parser.add_argument('-f', '--force_training', dest='force', action='store_true')
+parser.add_argument('--domain', type=str, default='melSpectrogram.70')
+parser.add_argument('--mid1', dest='mid_1', default=64, type=int)
+parser.add_argument('--mid2', dest='mid_2', default=32, type=int)
+parser.add_argument('--epoch', default=60, type=int)
+# debug parser.add_argument('--epoch', default=2, type=int)
+parser.add_argument('-v', '--verbose', dest='verbose', action='store_true')
+parser.add_argument('-t', '--tmp', dest='tmp', action='store_true')
+parser.add_argument('-l', '--log', dest='log', action='store_true')
+parser.add_argument('--core', default=80, type=int)
+args = parser.parse_args()
+params = vars(args)
+
+
+#################
+# setting
+#################
+w_and_s = args.w_and_s
+w_length, w_shift = read_length_shift(w_and_s)
+domain = args.domain
+flac_dim = 70
+part = 'MainBearing1'
+target = args.gmm
+n_epoch = args.epoch
+covar = args.covar
+files = args.files
+n_component = args.component
+n_bottleneck = args.bottleneck
+n_core = args.core
+mid1 = args.mid_1
+mid2 = args.mid_2
+sampling_freq = 25600
+output_log = args.verbose
+
+calc = CalcFeature(window_interval=int(sampling_freq * float(w_shift)),
+                   window_length=int(sampling_freq * float(w_length)),
+                   sample_rate=sampling_freq)
+#試験対象，今回はsuzu20なので，こうする．
+target_list_dir = Path('../../inoue/CMS-data/CMS/list')
+target_feature_dir=Path('/mnt/kiso-qnap/wakayama/wind-anomaly-detection/CMS/')
+
+#正常モデル
+train_list_dir= Path('./data/CMS/list/')
+#あらゆる正常状態の全て
+all_list_dir = Path('./data/CMS/list/normal_all/normal.MainBearing1')
+feature_dir = Path('./data/CMS/feature')
+
+
+
+vib_dir = Path('./data/CMS/cmsdata/')
+my_vib_dir = Path('../../inoue/CMS-data/CMS/vibration')
+my_data_dir = Path('./data/CMS/20230519-anomarity/FLAC-openDAE-targetGMM')
+
+data_dir = Path('./data/CMS/20210701-base/FLAC-openDAE-targetGMM')
+ae_model_dir = my_data_dir / 'AE' / f'{domain}_seven_layers' / 'without_batchnorm' / f'{w_and_s}_bottleneck_{n_bottleneck}dim' / f'{mid1}_{mid2}'
+# ae_model_dir = data_dir / 'AE' / target / f'{domain}_seven_layers' / f'bottleneck_{n_bottleneck}dim' / f'{mid1}_{mid2}'
+ae_model_file = ae_model_dir / f'input_{domain}_epoch{n_epoch}.pth'
+gmm_model_dir = my_data_dir / 'GMM' / target / f'AE_{domain}' / f'{mid1}_{mid2}' / f'bottleneck_{n_bottleneck}dim' / f'{files}files'
+gmm_model_file = gmm_model_dir / f'bn_{n_bottleneck}_component_{n_component}.pkl'
+adaptive_gmm_model_file = gmm_model_dir / f'adaptive_bn_{n_bottleneck}_component_{n_component}.pkl'
+
+
+score_file_dir = my_data_dir / 'score' / target / f'{domain}_{w_and_s}' / f'{mid1}_{mid2}' / f'{files}files'
+result_file_dir = data_dir / 'result' / target / f'{domain}_{w_and_s}' / f'{mid1}_{mid2}'
+result_file = result_file_dir / f'bn{n_bottleneck}_component{n_component}_covar_{covar}.csv'
+
+pathlib_mkdir([ae_model_dir, gmm_model_dir, score_file_dir, result_file_dir])
+
+
+#######################################
+# feature calculating
+#######################################
+#既に特徴量は計算している．
+def calc_feature(i_dir):
+    mat_file = my_vib_dir / f'{i_dir}.mat'
+    bin_file = my_vib_dir / f'{i_dir}.bin'
+    if mat_file.is_file():
+        data = loadmat(str(mat_file))
+        x_data = dc_offset(np.array(data['x']))
+        # rotation = data['RotationNo']
+        x_data = x_data.reshape(-1, )
+    elif bin_file.is_file():
+        try:
+            (headers, data) = read_bin(str(bin_file))
+            # rotation = headers[6]a
+            x_data = dc_offset(np.array(data))
+        except TypeError:
+            return None
+    else:
+        
+        raise FileNotFoundError("cannot find file")
+
+    try:
+        freq_array = calc.freq_domain(x_data)
+        return freq_array
+    except:
+        return None
+
+
+def file_check(i_file):
+    #feature_file = target_feature_dir / w_and_s / domain / f'{i_file}.pkl'
+    feature_file = target_feature_dir / domain / f'{i_file}.pkl'
+    feature_file.parent.mkdir(parents=True, exist_ok=True)
+    if feature_file.is_file():
+        pass
+    else:
+        # feature_vector = calc_feature(i_file)
+        # joblib.dump(feature_vector, feature_file)
+        pass
+    return feature_file
+
+#test_listからifileを呼んでる
+def file_target_check(i_file):
+    feature_file = target_feature_dir / domain / f'{i_file}.pkl'
+    feature_file.parent.mkdir(parents=True, exist_ok=True)
+    if feature_file.is_file():
+        pass
+    else:
+        #feature_vector = calc_feature(i_file)
+        #joblib.dump(feature_vector, feature_file)
+        pass
+    return feature_file
+
+
+#######################################
+# list file reading
+#######################################
+all_list = list(all_list_dir.glob('*.list')) #*.list
+all_list = [i for i in all_list if str(i).find('._') == -1]
+print(len(all_list))
+for i in all_list:
+    if str(i).find('iwaya07') != -1:
+        all_list.remove(i)
+    if str(i).find('mutsu-ogawara21') != -1:
+        all_list.remove(i)
+    if str(i).find('suzu20') != -1:
+        all_list.remove(i)
+        
+print(len(all_list))
+
+#train_normal_list_filename = train_list_dir / 'cutin_train_normal.iwaya07.MainBearing1.list'
+#その後suzuの評価やtarget model作成
+test_list_filename = target_list_dir / f'{target}.1_MainBearing_Vib1.list'
+
+#train_normal_list = load_list_file(train_normal_list_filename)[:files]
+#test_list
+test_list = load_list_file(test_list_filename)
+
+
+ae_train_normal_list = list()
+
+for i_num, i_list in enumerate(sorted(all_list)):
+    #print(ae_train_normal_list)
+    ae_train_normal_list.extend(load_list_file(i_list))
+
+#######################################
+# feature file existing check
+#######################################
+
+with Pool(n_core) as p:
+    ae_normal_files = list(tqdm(p.imap(file_check, ae_train_normal_list), total=len(ae_train_normal_list)))
+    #train_normal_files = list(tqdm(p.imap(file_check, train_normal_list), total=len(train_normal_list)))
+    test_files = list(tqdm(p.imap(file_target_check, test_list), total=len(test_list)))
+    # ましなやつ
+    # train_normal_files = test_files[5835:6700]
+    #train_normal_files = test_files[5835:6400]
+    train_normal_files = test_files[5835:6400]
+    print(test_files[5835],test_files[6400])
+    test_files=test_files[6400:]
+    #gmmはtrain_normal_filesの200要素分
+    print(len(train_normal_files))
+    #これが201609020105.pklから 201612070105まで
+    print(train_normal_files[0],train_normal_files[-1])
+
+#plot_list = train_normal_files + test_normal_files + test_faulty_files
+
+
+#######################################
+# data loading
+#######################################
+
+feature_loader = GetBinaryFeature()
+with Pool(n_core) as p:
+    _ae_normal_data_list = list(tqdm(p.imap(feature_loader.load_feature, ae_normal_files)))
+
+_ae_normal_data_list = dropna_from_list(_ae_normal_data_list)
+
+#######################################
+# Pre Processing
+#######################################
+_ae_train_normal_data = np.asarray(unroll(_ae_normal_data_list))
+
+print(_ae_train_normal_data.shape)
+exit()
+ae_train_normal_data, _ = split_rotation(_ae_train_normal_data, flac_dim)
+
+ae_preprocess_model = MinMaxScaler()
+ae_preprocess_model.fit(ae_train_normal_data)
+
+train_normal_data = torch.from_numpy(ae_preprocess_model.transform(ae_train_normal_data)).float()
+
+dataset = torch.utils.data.TensorDataset(train_normal_data, train_normal_data)
+train_loader = DataLoader(dataset, batch_size=512, shuffle=True)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+#######################################
+# SingleAutoEncoder
+#######################################
+def train_basic_step(train_loader: DataLoader, automodel: DAEwoBatchNorm, criterion, optimizer, epoch, device):
+    sum_loss = 0.
+
+    for batch_idx, (x_input, x_output) in enumerate(train_loader):
+        x_input, x_output = x_input.to(device), x_output.to(device)
+        # ===============forward=================
+        x_bar, _ = automodel(x_input)
+        loss = criterion(x_output, x_bar)
+        # ===============backward================
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        # =================log===================
+        sum_loss += loss
+
+    print("{} epoch\tDecoder loss: {:.5f}".format(epoch, sum_loss / len(train_loader)))
+    return sum_loss / len(train_loader)
+
+
+singleAE = DAEwoBatchNorm(flac_dim, n_bottleneck, mid1=mid1, mid2=mid2)
+if not ae_model_file.exists() or args.network:
+    if torch.cuda.device_count() > 1:
+        singleAE = nn.DataParallel(singleAE)
+        print("Let's use ", torch.cuda.device_count(), "GPUs!")
+    singleAE.to(device)
+    criterion = nn.MSELoss().to(device)
+    optimizer = optim.Adam(singleAE.parameters())
+    singleAE.train()
+
+    for i_epoch in range(1, n_epoch+1):
+        epoch_loss = train_basic_step(train_loader, singleAE, criterion, optimizer, i_epoch, device)
+    torch.save(singleAE.state_dict(), ae_model_file)
+else:
+    print("already DAE trained")
+
+singleAE.load_state_dict(torch.load(ae_model_file,map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu")), strict=False)
+
+###################
+# GMM preparation
+###################
+singleAE.eval()
+device = torch.device("cpu")
+singleAE = singleAE.to(device)
+
+with Pool(n_core) as p:
+    _gmm_train_normal_data_list = list(tqdm(p.imap(feature_loader.load_feature, train_normal_files)))
+    _test_data_list = list(tqdm(p.imap(feature_loader.load_feature, test_files)))
+
+
+_gmm_train_normal_data_list = dropna_from_list(_gmm_train_normal_data_list)
+_test_data_list = dropna_from_list(_test_data_list)
+
+
+
+
+def get_feature(x_input):
+    singleAE.eval()
+    x_input = torch.from_numpy(ae_preprocess_model.transform(x_input)).float()
+    x_input = x_input.cpu()
+    with torch.no_grad():
+        x_input = x_input.to(torch.device('cpu'))
+        _, bn = singleAE(x_input)
+        bn = bn.cpu().detach().numpy()
+    return bn
+
+
+gmm_train_normal_data_list = np.asarray(unroll(_gmm_train_normal_data_list))
+gmm_train_normal_data, _ = split_rotation(gmm_train_normal_data_list, gmm_train_normal_data_list.shape[1])#-1
+
+bn_feature = get_feature(gmm_train_normal_data)
+
+gmm_train_data = bn_feature
+
+gmm_minmax_model = StandardScaler()
+gmm_minmax_model.fit(gmm_train_data)
+
+###############
+# GMM training
+###############
+print(len(train_normal_files))
+#gmmは毎回学習するようになっている．
+if not gmm_model_file.exists() or args.force:
+    gmm = GaussianMixture(n_components=n_component, covariance_type=covar)
+    gmm.fit(gmm_minmax_model.transform(gmm_train_data))
+    joblib.dump(gmm, gmm_model_file)
+else:
+    pass
+
+train_model = joblib.load(gmm_model_file)
+train_adaptive_model = joblib.load(gmm_model_file)
+
+'''
+ここまでで，風車の正常状態の学習が完了している．
+
+
+1.ある区間の異常頻度が超えている割合の図示
+閾値や時間幅は適当
+#とりあえず正常モデルを使って，
+異常が進んでヤバくなるごとに頻度とかもヤバくなってるか、確かめる
+2.適応モデルを作ってみる
+前の感じを引き続きやっていけばいいが、適応モデルを作っていくときは、照合機だけを更新していく、更新の仕方はemアルゴリズムをし直す。ちゃんと詳細を見て考える。ここがちょっとよくわからない？？
+3.評価指標を定性的に図示する。
+例　
+正常モデルと適応モデルの異常の頻度の割合を時間的に図示したもの。
+適応モデルでの異常の頻度の割合を時間的に図示したもの。など
+これで、ちゃんと適応モデルが1番で調べたようなものの望んだ出力になってんか確かめる
+emアルゴリズムの件は何日か前までのデータを用いてfitさせる感じで良い？
+'''
+
+
+print(ae_train_normal_list)
+exit()
+
+###################
+# calculating score
+###################
+def calc_score(data,adaptive=False):
+    global train_adaptive_model
+    if data is None:
+        return
+    input_data, _ = split_rotation(data, data.shape[1])#-1
+    bn_features = get_feature(input_data)
+    if adaptive:
+         score = -1 * train_adaptive_model.score_samples(gmm_minmax_model.transform(bn_features))
+    else:
+        score = -1 * train_model.score_samples(gmm_minmax_model.transform(bn_features))
+    median_score = np.median(score)
+    return median_score, bn_features, score
+
+
+####################
+# datetime and score
+####################
+
+def prepare_plot(i_file):
+    try:
+        load_feature = feature_loader.load_feature(i_file)
+        score, bnf, tot_score = calc_score(load_feature)
+        date_name = os.path.splitext(os.path.basename(i_file))[0]
+        year = date_name[-12:-8]
+        month = date_name[-8:-6]
+        day = date_name[-6:-4]
+        hour = date_name[-4:-2]
+        minute = date_name[-2:]
+        date = '{}-{}-{} {}:{}'.format(year, month, day, hour, minute)
+
+        print(load_feature.shape)
+        print(score)
+        print(date)
+        return {'date': date,
+                'score': score,
+                'seq_score': tot_score,
+                'input_feature': load_feature,
+                'BNF': bnf}
+
+    except Exception as e:
+        print(traceback.format_exc())
+        print(e)
+        return None
+
+####################
+# datetime and score
+####################
+buffer_list=np.array([])
+def adaptive_prepare_plot(i_file,cnt):
+    global train_adaptive_model
+    global gmm_adaptive_minmax_model
+    global gmm_train_data
+    global buffer_list
+    try:
+        load_feature = feature_loader.load_feature(i_file)
+        score, bnf, tot_score = calc_score(load_feature,True)
+        date_name = os.path.splitext(os.path.basename(i_file))[0]
+        year = date_name[-12:-8]
+        month = date_name[-8:-6]
+        day = date_name[-6:-4]
+        hour = date_name[-4:-2]
+        minute = date_name[-2:]
+        date = '{}-{}-{} {}:{}'.format(year, month, day, hour, minute)
+
+        print(load_feature.shape)
+        print(score)
+        print(date)
+        
+
+        gmm_adaptive_data, _ = split_rotation(load_feature, flac_dim)
+
+        bn_feature = get_feature(gmm_adaptive_data)
+        if len(buffer_list)==0:
+            buffer_list=bn_feature
+        else:
+            buffer_list=np.concatenate((buffer_list,bn_feature),axis=0)
+        
+        if cnt%50==0:            
+            gmm_train_data=np.concatenate((gmm_train_data[buffer_list.shape[0]:],buffer_list),axis=0)
+            print(len(gmm_train_data))
+
+            
+            gmm_adaptive_minmax_model = StandardScaler()
+            gmm_adaptive_minmax_model.fit(gmm_train_data)
+
+            ###############
+            # GMM training
+            ###############
+            #if not gmm_model_file.exists() or args.force:
+            #gmm = GaussianMixture(n_components=n_component, covariance_type=covar)
+            train_adaptive_model.fit(gmm_adaptive_minmax_model.transform(gmm_train_data)) 
+            #joblib.dump(train_adaptive_model, gmm_adaptive_model_files)
+            #else:
+            #    pass
+
+            #train_adaptive_model = joblib.load(gmm_adaptive_model_files)
+            buffer_list=np.array([])
+        return {'date': date,
+                'score': score,
+                'seq_score': tot_score,
+                'input_feature': load_feature,
+                'BNF': bnf}
+
+    except Exception as e:
+        print(traceback.format_exc())
+        print(e)
+        return None
+
+def score_from_linear_to_log(score_list):
+    #min_score = min(score_list, key=lambda x: x['score'])['score']
+    #result = [{'date': d['date'], 'score': math.log10(d['score'] - min_score+0.001), 'seq_score': d['seq_score'],'input_feature': d['input_feature'],'BNF': d['BNF']} for d in score_list] 
+# Noneを除外してから最小値を取得する
+    filtered_scores = [item for item in score_list if item is not None]
+    min_score = min(filtered_scores, key=lambda x: x['score'])['score']
+
+    # 各要素から最小値を引く
+    result = []
+    for item in score_list:
+        if item is not None:
+            item['score'] =math.log10(item['score'] - min_score+0.0001)
+        result.append(item)
+    return result
+
+train_score_list = [prepare_plot(i) for i in tqdm(dropna_from_list(train_normal_files), desc='TrainScore')]
+test_score_list = [prepare_plot(i) for i in tqdm(dropna_from_list(test_files), desc='TestScore')]
+#adaptive_test_score_list = [adaptive_prepare_plot(i,cnt+1) for cnt,i in tqdm( enumerate(dropna_from_list(test_files)), desc='AdaptiveTestScore')]
+
+train_score_list=score_from_linear_to_log(train_score_list)
+test_score_list=score_from_linear_to_log(test_score_list)
+#adaptive_test_score_list=score_from_linear_to_log(adaptive_test_score_list)
+
+train_score = [d.get('score') for d in dropna_from_list(train_score_list)]
+test_score = [d.get('score') for d in dropna_from_list(test_score_list)]
+#adaptive_test_score = [d.get('score') for d in dropna_from_list(adaptive_test_score_list)]
+
+score_dump_dir = score_file_dir 
+pathlib_mkdir([score_dump_dir])
+joblib.dump(train_score_list, score_dump_dir / 'train_score.pkl')
+joblib.dump(test_score_list, score_dump_dir / 'test_score.pkl')
+#joblib.dump(adaptive_test_score_list, score_dump_dir / 'adaptive_test_score.pkl')
+
+exit()
+###################
+# ROC
+###################
+scoring = ScoreSave(save_dir=score_file_dir)
+
+fpr, tpr, threshold = scoring.eer(abnormal_score=faulty_score, normal_score=normal_score)
+roc_auc = scoring.calc_auc(fpr, tpr)
+print(roc_auc)
+
+###################
+# f-measure
+###################
+f_value = f_value(train_score, normal_score, faulty_score,
+                  designed_percentile=args.designed_percentile)
+accuracy4test = calc_healthy_sample_accuracy(train_score, normal_score)
+faulty4test = calc_anomaly_sample_accuracy(train_score, faulty_score)
+
+hsr = accuracy4test['Accuracy']
+asr = faulty4test['Accuracy']
+
+
+df1 = {'File': files, 'Bottleneck': n_bottleneck, 'Components': n_component,
+       'AUC': roc_auc, 'HSR': hsr, 'ASR': asr, 'F': f_value['f-measure'],
+       'Threshold': accuracy4test['threshold'], 'PCA': False, 'mid1': mid1, 'mid2': mid2}
+
+if result_file.exists():
+    df = pd.read_csv(result_file)
+    df = df.append(df1, ignore_index=True)
+else:
+    df = pd.DataFrame(df1, index=[0])
+df.to_csv(result_file, index=False)
+
+
+#score_dump_dir = score_file_dir / f'ROC:{roc_auc:.2f}_HSR:{hsr:.2f}_ASR:{asr:.2f}'
+score_dump_dir = score_file_dir 
+pathlib_mkdir([score_dump_dir])
+joblib.dump(train_score_list, score_dump_dir / 'train_score.pkl')
+joblib.dump(test_score_list, score_dump_dir / 'test_score.pkl')
+
